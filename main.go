@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,16 @@ var (
 	// Profile ID for SQL Injection Vulnerabilities
 	sqlInjectionProfileID = "11111111-1111-1111-1111-111111111113"
 )
+
+// Helper to sanitize URLs identically to JS
+func normalizeTarget(target string) string {
+	u, err := url.Parse(target)
+	if err != nil {
+		return strings.ToLower(strings.TrimSuffix(target, "/"))
+	}
+	// Remove scheme, force to lower case, remove trailing slash
+	return strings.ToLower(strings.TrimSuffix(u.Host+u.Path, "/"))
+}
 
 // Global Job Manager
 var jobQueue = make(chan ScanJob, 10000)
@@ -70,14 +81,15 @@ type ScanJob struct {
 }
 
 func main() {
-	// Start Worker Pool
-	for i := 0; i < maxWorkers; i++ {
+	// Start Worker Pool - initialize a large pool to handle spikes but throttle via maxWorkers dynamically
+	for i := 0; i < 100; i++ {
 		go worker()
 	}
 
 	http.HandleFunc("/", homeHandler)
 	http.HandleFunc("/api/login", loginHandler)
 	http.HandleFunc("/api/scan/queue", queueHandler)
+	http.HandleFunc("/api/scan/cancel", cancelHandler)
 	http.HandleFunc("/api/scan/status", statusHandler)
 	http.HandleFunc("/api/extract", extractHandler)
 	http.HandleFunc("/api/acunetix/stats", acunetixStatsHandler)
@@ -94,12 +106,34 @@ func main() {
 // ----------------------------------------------------
 func worker() {
 	for job := range jobQueue {
+		// Wait if we are at/over the max limit
+		for {
+			workerCountMu.Lock()
+			activeMu.Lock()
+			if activeWorkers < maxWorkers {
+				activeWorkers++
+				activeMu.Unlock()
+				workerCountMu.Unlock()
+				break
+			}
+			activeMu.Unlock()
+			workerCountMu.Unlock()
+			time.Sleep(1 * time.Second)
+		}
+
+		// Check if target was cancelled while waiting
+		if res, ok := resultsStore.Load(job.Target); ok {
+			status := res.(ScanResult).Status
+			if status == "Cancelled" {
+				activeMu.Lock()
+				activeWorkers--
+				activeMu.Unlock()
+				continue
+			}
+		}
+
 		// Mark as running
 		resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Running", Message: "Starting scan..."})
-
-		activeMu.Lock()
-		activeWorkers++
-		activeMu.Unlock()
 
 		// 1. Add Target
 		targetID, err := addTarget(job.Client, job.APIURL, job.APIKey, job.Target)
@@ -228,27 +262,141 @@ func pollScan(client *http.Client, apiURL, apiKey, scanID string) error {
 		req.Header.Set("X-Auth", apiKey)
 		resp, err := client.Do(req)
 		if err != nil {
+			// Log the error but continue polling if it's a transient network issue
+			log.Printf("Error polling scan %s: %v", scanID, err)
 			continue
 		}
+		defer resp.Body.Close() // Ensure body is closed in each iteration
 
-		var statusResp struct {
+		var result struct {
 			CurrentSession struct {
 				Status string `json:"status"`
 			} `json:"current_session"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&statusResp); err == nil {
-			status := statusResp.CurrentSession.Status
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return fmt.Errorf("failed to decode status for scan %s: %v", scanID, err)
+		}
+
+		status := result.CurrentSession.Status
+		if status == "completed" {
+			return nil // Scan finished successfully
+		}
+		if status == "failed" || status == "aborted" {
+			return fmt.Errorf("scan %s ended with status: %s", scanID, status)
+		}
+
+		// If not completed, failed, or aborted, it's still running. Continue polling.
+	}
+}
+
+// Helper to explicitly fetch all targets and active scans from Acunetix to cross-check duplicates
+func fetchExistingTargets(client *http.Client, apiURL, apiKey string) (map[string]bool, int, error) {
+	existingMap := make(map[string]bool)
+	runningCount := 0
+	cursor := "0"
+
+	// 1. Fetch Targets with pagination
+	for {
+		req, err := http.NewRequest("GET", fmt.Sprintf("%s/targets?c=%s&l=100", apiURL, cursor), nil)
+		if err != nil {
+			return existingMap, 0, err
+		}
+		req.Header.Set("X-Auth", apiKey)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return existingMap, 0, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if status == "completed" || status == "aborted" || status == "failed" {
-				if status == "aborted" || status == "failed" {
-					return fmt.Errorf("Scan finished with status: %s", status)
-				}
-				return nil
-			}
+			return existingMap, 0, fmt.Errorf("Acunetix targets API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		}
+
+		var targetResult struct {
+			Targets []struct {
+				Address string `json:"address"`
+			} `json:"targets"`
+			Pagination struct {
+				Cursors []interface{} `json:"cursors"`
+			} `json:"pagination"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&targetResult); err != nil {
+			resp.Body.Close()
+			return existingMap, 0, err
+		}
+		resp.Body.Close()
+
+		for _, t := range targetResult.Targets {
+			existingMap[normalizeTarget(t.Address)] = true
+		}
+
+		// Check for next cursor (index 0 is next, index 1 might be prev)
+		if len(targetResult.Pagination.Cursors) > 0 && targetResult.Pagination.Cursors[0] != nil {
+			cursor = fmt.Sprintf("%v", targetResult.Pagination.Cursors[0])
 		} else {
-			resp.Body.Close()
+			break
 		}
 	}
+
+	// 2. Fetch Scans to count current running workload with pagination
+	cursor = "0"
+	for {
+		reqS, err := http.NewRequest("GET", fmt.Sprintf("%s/scans?c=%s&l=100", apiURL, cursor), nil)
+		if err != nil {
+			log.Printf("fetchExistingTargets: Failed to create scan request: %v", err)
+			break
+		}
+		reqS.Header.Set("X-Auth", apiKey)
+		respS, err := client.Do(reqS)
+		if err != nil {
+			log.Printf("fetchExistingTargets: Failed to fetch scans: %v", err)
+			break
+		}
+
+		if respS.StatusCode != http.StatusOK {
+			respS.Body.Close()
+			log.Printf("fetchExistingTargets: Scans API returned status %d", respS.StatusCode)
+			break
+		}
+
+		var scanResult struct {
+			Scans []struct {
+				CurrentSession struct {
+					Status string `json:"status"`
+				} `json:"current_session"`
+			} `json:"scans"`
+			Pagination struct {
+				Cursors []interface{} `json:"cursors"`
+			} `json:"pagination"`
+		}
+
+		if err := json.NewDecoder(respS.Body).Decode(&scanResult); err != nil {
+			respS.Body.Close()
+			log.Printf("fetchExistingTargets: Failed to decode scans: %v", err)
+			break
+		}
+		respS.Body.Close()
+
+		for _, s := range scanResult.Scans {
+			stat := strings.ToLower(s.CurrentSession.Status)
+			// Scans taking up engine slots:
+			if stat == "processing" || stat == "starting" || stat == "queued" || stat == "running" || stat == "scheduled" {
+				runningCount++
+			}
+		}
+
+		if len(scanResult.Pagination.Cursors) > 0 && scanResult.Pagination.Cursors[0] != nil {
+			cursor = fmt.Sprintf("%v", scanResult.Pagination.Cursors[0])
+		} else {
+			break
+		}
+	}
+
+	log.Printf("fetchExistingTargets: Found %d remote targets, %d active scans", len(existingMap), runningCount)
+	return existingMap, runningCount, nil
 }
 
 // ----------------------------------------------------
@@ -316,11 +464,7 @@ func queueHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	workerCountMu.Lock()
-	if payload.MaxScans > 0 && payload.MaxScans > maxWorkers {
-		diff := payload.MaxScans - maxWorkers
-		for i := 0; i < diff; i++ {
-			go worker()
-		}
+	if payload.MaxScans > 0 {
 		maxWorkers = payload.MaxScans
 	}
 	workerCountMu.Unlock()
@@ -328,7 +472,25 @@ func queueHandler(w http.ResponseWriter, r *http.Request) {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
+	client := &http.Client{Transport: tr, Timeout: 30 * time.Second} // longer timeout for fetching master lists
+
+	// Fetch existing targets to prevent remote duplication and sync active count
+	existingTargets, remoteRunning, err := fetchExistingTargets(client, payload.APIURL, payload.APIKey)
+	if err != nil {
+		log.Printf("Warning: Failed to fetch remote targets for deduplication: %v", err)
+		// Proceed anyway, but the map will be empty
+	}
+
+	log.Printf("Queue Request: Targets=%d, RemoteRunning=%d, MaxLimit=%d", len(payload.Targets), remoteRunning, maxWorkers)
+
+	// Sync activeWorkers to reality
+	activeMu.Lock()
+	activeWorkers = remoteRunning
+	activeMu.Unlock()
+
+	var skipped []string
+	var queued int
+	localDedupe := make(map[string]bool) // For local deduplication within the current request
 
 	for _, t := range payload.Targets {
 		t = strings.TrimSpace(t)
@@ -336,17 +498,42 @@ func queueHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		resultsStore.Store(t, ScanResult{Target: t, Status: "Pending", Message: "Waiting in queue..."})
+		norm := normalizeTarget(t)
+
+		// Check for local deduplication within this request
+		if localDedupe[norm] {
+			skipped = append(skipped, t)
+			continue
+		}
+		localDedupe[norm] = true
+
+		// Check if it already exists remotely
+		if existingTargets[norm] {
+			skipped = append(skipped, t)
+			continue
+		}
+
+		// Push to channel
 		jobQueue <- ScanJob{
 			APIURL: payload.APIURL,
 			APIKey: payload.APIKey,
 			Target: t,
-			Client: client,
+			Client: &http.Client{Transport: tr, Timeout: 10 * time.Second}, // Standard timeout for worker threads
 		}
+
+		resultsStore.Store(t, ScanResult{Target: t, Status: "Pending", Message: "Waiting in queue..."})
+		queued++
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "Jobs added to queue"})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":         "Jobs processed",
+		"queue_length":    len(jobQueue),
+		"active_workers":  activeWorkers, // These two are not locked, might be slightly out of sync
+		"max_workers":     maxWorkers,    // but acceptable for a status response
+		"skipped_targets": skipped,
+		"queued_count":    queued,
+	})
 }
 
 // Returns state of all submitted targets + Queue stats
@@ -375,6 +562,44 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
+}
+
+// Cancel a pending target by overriding its ResultsStore status
+func cancelHandler(w http.ResponseWriter, r *http.Request) {
+	if !isAuthenticated(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Target string `json:"target"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Target == "" {
+		http.Error(w, "Target required", http.StatusBadRequest)
+		return
+	}
+
+	if res, ok := resultsStore.Load(req.Target); ok {
+		scanRes := res.(ScanResult)
+		if scanRes.Status == "Pending" {
+			scanRes.Status = "Cancelled"
+			scanRes.Message = "Cancelled by user"
+			resultsStore.Store(req.Target, scanRes)
+			json.NewEncoder(w).Encode(map[string]bool{"success": true})
+			return
+		}
+	}
+
+	http.Error(w, "Target not found or already running", http.StatusBadRequest)
 }
 
 // Parses JSON Lines, CSV or raw text files and extracts the specified key property
@@ -469,8 +694,14 @@ func extractHandler(w http.ResponseWriter, r *http.Request) {
 
 // Queries Acunetix API directly for global scan statuses
 func acunetixStatsHandler(w http.ResponseWriter, r *http.Request) {
+	sendJSONError := func(msg string, code int) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	}
+
 	if !isAuthenticated(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		sendJSONError("Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -479,11 +710,12 @@ func acunetixStatsHandler(w http.ResponseWriter, r *http.Request) {
 		APIKey string `json:"api_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		sendJSONError("Invalid JSON payload", http.StatusBadRequest)
 		return
 	}
 
 	if payload.APIURL == "" || payload.APIKey == "" {
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]int{})
 		return
 	}
@@ -491,43 +723,57 @@ func acunetixStatsHandler(w http.ResponseWriter, r *http.Request) {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
-
-	req, err := http.NewRequest("GET", payload.APIURL+"/scans?c=0&l=1000", nil)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("X-Auth", payload.APIKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf("Acunetix returned status %d", resp.StatusCode), http.StatusInternalServerError)
-		return
-	}
-
-	var result struct {
-		Scans []struct {
-			CurrentSession struct {
-				Status string `json:"status"`
-			} `json:"current_session"`
-		} `json:"scans"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		http.Error(w, "Failed to parse Acunetix response", http.StatusInternalServerError)
-		return
-	}
+	client := &http.Client{Transport: tr, Timeout: 30 * time.Second} // Increased timeout
 
 	counts := make(map[string]int)
-	for _, scan := range result.Scans {
-		counts[scan.CurrentSession.Status]++
+	cursor := "0"
+	for {
+		req, err := http.NewRequest("GET", fmt.Sprintf("%s/scans?c=%s&l=100", payload.APIURL, cursor), nil)
+		if err != nil {
+			sendJSONError(err.Error(), http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("X-Auth", payload.APIKey)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			sendJSONError(err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			sendJSONError(fmt.Sprintf("[WebFeeder] Acunetix API error status: %d", resp.StatusCode), http.StatusInternalServerError)
+			return
+		}
+
+		var result struct {
+			Scans []struct {
+				CurrentSession struct {
+					Status string `json:"status"`
+				} `json:"current_session"`
+			} `json:"scans"`
+			Pagination struct {
+				Cursors []interface{} `json:"cursors"`
+			} `json:"pagination"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			sendJSONError("[WebFeeder] Failed to parse Acunetix response JSON", http.StatusInternalServerError)
+			return
+		}
+		resp.Body.Close()
+
+		for _, scan := range result.Scans {
+			counts[strings.ToLower(scan.CurrentSession.Status)]++
+		}
+
+		if len(result.Pagination.Cursors) > 0 && result.Pagination.Cursors[0] != nil {
+			cursor = fmt.Sprintf("%v", result.Pagination.Cursors[0])
+		} else {
+			break
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -758,11 +1004,18 @@ const htmlTemplate = `<!DOCTYPE html>
         <!-- TARGETS -->
         <div class="section-title">🎯 Scan Queue Setup</div>
         <div class="form-group">
-            <label>Targets (One per line)</label>
+            <label>Targets (One per line). Duplicates will be automatically omitted before queueing.</label>
             <textarea id="targets" placeholder="Extracted targets will appear here...&#10;http://target1.com"></textarea>
+            <div id="duplicate-warning" style="color: var(--warning); font-size: 13px; margin-top: 8px; display: none;"></div>
         </div>
 
         <button onclick="queueScans()" id="scan-btn">Add to Scan Queue <span class="loader" id="scan-loader"></span></button>
+        
+        <!-- SKIPPED TARGETS LOG -->
+        <div class="form-group hidden" id="skipped-box" style="margin-top: 20px;">
+            <label style="color: var(--warning);">⚠️ Skipped Targets (Already exists in Acunetix remotely)</label>
+            <textarea id="skipped-targets" readonly style="min-height: 80px; font-size:12px; color: var(--text-muted); background: #161b22;"></textarea>
+        </div>
         
         <!-- QUEUE STATS -->
         <div class="queue-stats hidden" id="queue-stats">
@@ -780,10 +1033,22 @@ const htmlTemplate = `<!DOCTYPE html>
     <script>
         let pollInterval = null;
 
+        // Auto-load saved credentials
+        document.addEventListener('DOMContentLoaded', () => {
+            if (localStorage.getItem('acu_url')) document.getElementById('api-url').value = localStorage.getItem('acu_url');
+            if (localStorage.getItem('acu_key')) document.getElementById('api-key').value = localStorage.getItem('acu_key');
+            if (localStorage.getItem('acu_max')) document.getElementById('max-scans').value = localStorage.getItem('acu_max');
+        });
+
         if (document.cookie.includes("session_token")) {
             document.getElementById('login-screen').classList.add('hidden');
             document.getElementById('dashboard-screen').classList.remove('hidden');
             startPolling();
+        }
+
+        // Normalizes URLs by removing scheme, www., and trailing slashes for duplicate checking
+        function normalizeTarget(url) {
+            return url.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/$/, '').toLowerCase();
         }
 
         function handleLoginKey(e) {
@@ -877,13 +1142,46 @@ const htmlTemplate = `<!DOCTYPE html>
             const maxScans = parseInt(document.getElementById('max-scans').value) || 10;
             const btn = document.getElementById('scan-btn');
             const loader = document.getElementById('scan-loader');
+            const dupWarning = document.getElementById('duplicate-warning');
 
             if (!apiUrl || !apiKey || !targetsText) {
                 alert("Please fill in API URL, API Key, and at least one target.");
                 return;
             }
 
-            const targets = targetsText.split('\n').map(t => t.trim()).filter(t => t);
+            // Save to localStorage
+            localStorage.setItem('acu_url', apiUrl);
+            localStorage.setItem('acu_key', apiKey);
+            localStorage.setItem('acu_max', maxScans);
+
+            const rawTargets = targetsText.split('\n').map(t => t.trim()).filter(t => t);
+            
+            // Deduplicate
+            const uniqueTargets = [];
+            const seen = new Set();
+            let dupCount = 0;
+
+            for (const t of rawTargets) {
+                const norm = normalizeTarget(t);
+                if (!seen.has(norm)) {
+                    seen.add(norm);
+                    uniqueTargets.push(t);
+                } else {
+                    dupCount++;
+                }
+            }
+
+            if (uniqueTargets.length === 0) {
+                alert("No valid unique targets found to queue.");
+                return;
+            }
+
+            if (dupCount > 0) {
+                dupWarning.innerText = "Automatically dropped " + dupCount + " duplicate targets (HTTP/HTTPS/www overlaps).";
+                dupWarning.style.display = 'block';
+            } else {
+                dupWarning.style.display = 'none';
+            }
 
             btn.disabled = true;
             loader.style.display = 'inline-block';
@@ -895,12 +1193,30 @@ const htmlTemplate = `<!DOCTYPE html>
                     body: JSON.stringify({
                         api_url: apiUrl,
                         api_key: apiKey,
-                        targets: targets,
+                        targets: uniqueTargets,
                         max_scans: maxScans
                     })
                 });
 
-                if (res.status === 401) return handleLogout();
+                const data = await res.json();
+                
+                if (data.skipped_targets && data.skipped_targets.length > 0) {
+                    const skippedBox = document.getElementById('skipped-box');
+                    const skippedTextarea = document.getElementById('skipped-targets');
+                    skippedBox.classList.remove('hidden');
+                    
+                    const newSkips = data.skipped_targets.join('\n');
+                    const existingSkips = skippedTextarea.value.trim();
+                    skippedTextarea.value = existingSkips ? existingSkips + '\n' + newSkips : newSkips;
+                    
+                    if (dupCount > 0) {
+                        dupWarning.innerText = "Dropped " + dupCount + " local duplicates. Dropped " + data.skipped_targets.length + " remote Acunetix duplicates.";
+                    } else {
+                        dupWarning.innerText = "Dropped " + data.skipped_targets.length + " remote Acunetix duplicates.";
+                        dupWarning.style.display = 'block';
+                    }
+                }
+
                 document.getElementById('targets').value = '';
                 // Immediately poll to show pending items
                 pollStatus();
@@ -926,6 +1242,10 @@ const htmlTemplate = `<!DOCTYPE html>
             const apiUrl = document.getElementById('api-url').value.trim();
             const apiKey = document.getElementById('api-key').value.trim();
             if (!apiUrl || !apiKey) return;
+            
+            // Auto Update Storage if firing
+            localStorage.setItem('acu_url', apiUrl);
+            localStorage.setItem('acu_key', apiKey);
             
             const btn = document.getElementById('btn-gstats');
             btn.innerText = "Loading...";
@@ -983,12 +1303,34 @@ const htmlTemplate = `<!DOCTYPE html>
                     });
 
                     sorted.forEach(item => {
-                        html += "<div class=\"result-item\"><span style=\"max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;\" title=\"" + item.target + "\">" + item.target + "</span><span style=\"font-size:11px; color:#8b949e; max-width: 30%; overflow: hidden; white-space: nowrap;\" title=\"" + item.message + "\">" + item.message + "</span><span class=\"status-" + item.status + "\">[" + item.status + "]</span></div>";
+                        let cancelHtml = "";
+                        if (item.status === 'Pending') {
+                            cancelHtml = "<button onclick=\"cancelTarget('" + item.target + "')\" style=\"padding: 2px 6px; font-size:10px; border-radius:4px; max-width:65px; margin-left:10px; background:var(--danger);\">Cancel</button>";
+                        }
+                        
+                        html += "<div class=\"result-item\"><span style=\"max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;\" title=\"" + item.target + "\">" + item.target + "</span><span style=\"font-size:11px; color:#8b949e; max-width: 25%; overflow: hidden; white-space: nowrap;\" title=\"" + item.message + "\">" + item.message + "</span><div style=\"display:flex; align-items:center;\"><span class=\"status-" + item.status + "\">[" + item.status + "]</span>" + cancelHtml + "</div></div>";
                     });
                     resultsBox.innerHTML = html;
                 }
             } catch (err) {
                 console.error("Polling error", err);
+            }
+        }
+
+        async function cancelTarget(target) {
+            try {
+                const res = await fetch('/api/scan/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ target: target })
+                });
+                if (res.ok) {
+                    pollStatus(); // force UI update
+                } else {
+                    alert("Could not cancel. It may have already started.");
+                }
+            } catch (err) {
+                console.error("Cancel Error: ", err);
             }
         }
 
