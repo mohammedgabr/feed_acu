@@ -36,6 +36,10 @@ func normalizeTarget(target string) string {
 // Global Job Manager
 var jobQueue = make(chan ScanJob, 10000)
 var resultsStore = sync.Map{} // thread-safe map to store: targetURL -> ScanResult
+var remoteActiveCount = 0
+var lastRemoteSync time.Time
+var syncMu sync.Mutex
+
 var activeWorkers = 0
 var maxWorkers = 10
 var workerCountMu sync.Mutex
@@ -101,69 +105,138 @@ func main() {
 	}
 }
 
-// ----------------------------------------------------
-// WORKER POOL
-// ----------------------------------------------------
 func worker() {
 	for job := range jobQueue {
 		// Wait if we are at/over the max limit
+		cancelled := false
 		for {
+			syncMu.Lock()
+			// If sync is older than 5 seconds, refresh it
+			if time.Since(lastRemoteSync) > 5*time.Second {
+				log.Println("[Worker] Syncing remote scan load before starting next job...")
+				count, err := getRemoteScanCount(job.Client, job.APIURL, job.APIKey)
+				if err == nil {
+					remoteActiveCount = count
+					lastRemoteSync = time.Now()
+					log.Printf("[Worker] Remote sync complete. Total active scans: %d (Limit: %d)", remoteActiveCount, maxWorkers)
+				} else {
+					log.Printf("[Worker] Remote load check failed (possible Acunetix hang): %v. Waiting...", err)
+				}
+			}
+
 			workerCountMu.Lock()
-			activeMu.Lock()
-			if activeWorkers < maxWorkers {
-				activeWorkers++
-				activeMu.Unlock()
+			if remoteActiveCount < maxWorkers {
+				remoteActiveCount++
 				workerCountMu.Unlock()
+				syncMu.Unlock()
 				break
 			}
-			activeMu.Unlock()
 			workerCountMu.Unlock()
-			time.Sleep(1 * time.Second)
+			syncMu.Unlock()
+
+			// Check if target was cancelled while waiting
+			if res, ok := resultsStore.Load(job.Target); ok {
+				status := res.(ScanResult).Status
+				if status == "Cancelled" {
+					cancelled = true
+					break
+				}
+			}
+
+			time.Sleep(2 * time.Second)
 		}
 
-		// Check if target was cancelled while waiting
-		if res, ok := resultsStore.Load(job.Target); ok {
-			status := res.(ScanResult).Status
-			if status == "Cancelled" {
-				activeMu.Lock()
-				activeWorkers--
-				activeMu.Unlock()
-				continue
-			}
+		if cancelled {
+			continue
 		}
 
 		// Mark as running
 		resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Running", Message: "Starting scan..."})
 
 		// 1. Add Target
-		targetID, err := addTarget(job.Client, job.APIURL, job.APIKey, job.Target)
-		if err != nil {
-			resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Failed", Message: fmt.Sprintf("Add Target Error: %v", err)})
-			activeMu.Lock()
-			activeWorkers--
-			activeMu.Unlock()
-			continue
-		}
-
-		// 2. Start Scan
-		scanID, err := startScan(job.Client, job.APIURL, job.APIKey, targetID)
-		if err != nil {
-			resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Failed", Message: fmt.Sprintf("Start Scan Error: %v", err)})
+		tid, terr := addTarget(job.Client, job.APIURL, job.APIKey, job.Target)
+		if terr != nil {
+			resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Failed", Message: fmt.Sprintf("Add Target Error: %v", terr)})
 		} else {
-			resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Running", Message: "Scan running in Acunetix..."})
-			// 3. Poll Scan Status
-			err = pollScan(job.Client, job.APIURL, job.APIKey, scanID)
-			if err != nil {
-				resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Failed", Message: err.Error()})
+			// 2. Start Scan
+			sid, serr := startScan(job.Client, job.APIURL, job.APIKey, tid)
+			if serr != nil {
+				resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Failed", Message: fmt.Sprintf("Start Scan Error: %v", serr)})
 			} else {
-				resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Success", Message: "Scan completed"})
+				resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Running", Message: "Scan running in Acunetix..."})
+				// 3. Poll Scan Status
+				perr := pollScan(job.Client, job.APIURL, job.APIKey, sid)
+				if perr != nil {
+					resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Failed", Message: perr.Error()})
+				} else {
+					resultsStore.Store(job.Target, ScanResult{Target: job.Target, Status: "Success", Message: "Scan completed"})
+				}
 			}
 		}
 
-		activeMu.Lock()
-		activeWorkers--
-		activeMu.Unlock()
+		// When a job finishes, we decrement remoteActiveCount to stay responsive
+		syncMu.Lock()
+		if remoteActiveCount > 0 {
+			remoteActiveCount--
+		}
+		syncMu.Unlock()
 	}
+}
+
+// Dedicated helper to count total active scans on Acunetix with pagination
+func getRemoteScanCount(client *http.Client, apiURL, apiKey string) (int, error) {
+	count := 0
+	cursor := "0"
+	for {
+		req, err := http.NewRequest("GET", fmt.Sprintf("%s/scans?c=%s&l=100", apiURL, cursor), nil)
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("X-Auth", apiKey)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return 0, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		}
+
+		var result struct {
+			Scans []struct {
+				CurrentSession struct {
+					Status string `json:"status"`
+				} `json:"current_session"`
+			} `json:"scans"`
+			Pagination struct {
+				Cursors []interface{} `json:"cursors"`
+			} `json:"pagination"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return 0, err
+		}
+		resp.Body.Close()
+
+		for _, s := range result.Scans {
+			stat := strings.ToLower(s.CurrentSession.Status)
+			// Statuses that consume an engine slot
+			if stat == "processing" || stat == "starting" || stat == "queued" || stat == "running" || stat == "scheduled" {
+				count++
+			}
+		}
+
+		if len(result.Pagination.Cursors) > 0 && result.Pagination.Cursors[0] != nil {
+			cursor = fmt.Sprintf("%v", result.Pagination.Cursors[0])
+		} else {
+			break
+		}
+	}
+	return count, nil
 }
 
 func addTarget(client *http.Client, apiURL, apiKey, targetURL string) (string, error) {
@@ -483,10 +556,11 @@ func queueHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Queue Request: Targets=%d, RemoteRunning=%d, MaxLimit=%d", len(payload.Targets), remoteRunning, maxWorkers)
 
-	// Sync activeWorkers to reality
-	activeMu.Lock()
-	activeWorkers = remoteRunning
-	activeMu.Unlock()
+	// Refresh the global load cache immediately when a new batch is submitted
+	syncMu.Lock()
+	remoteActiveCount = remoteRunning
+	lastRemoteSync = time.Now()
+	syncMu.Unlock()
 
 	var skipped []string
 	var queued int
@@ -526,11 +600,15 @@ func queueHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	syncMu.Lock()
+	rac := remoteActiveCount
+	syncMu.Unlock()
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message":         "Jobs processed",
 		"queue_length":    len(jobQueue),
-		"active_workers":  activeWorkers, // These two are not locked, might be slightly out of sync
-		"max_workers":     maxWorkers,    // but acceptable for a status response
+		"active_workers":  rac,
+		"max_workers":     maxWorkers,
 		"skipped_targets": skipped,
 		"queued_count":    queued,
 	})
@@ -549,16 +627,18 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		return true
 	})
 
-	activeMu.Lock()
+	syncMu.Lock()
+	rac := remoteActiveCount
+	syncMu.Unlock()
+
 	workerCountMu.Lock()
 	stats := map[string]interface{}{
 		"results":        results,
 		"queue_length":   len(jobQueue),
-		"active_workers": activeWorkers,
+		"active_workers": rac,
 		"max_workers":    maxWorkers,
 	}
 	workerCountMu.Unlock()
-	activeMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
