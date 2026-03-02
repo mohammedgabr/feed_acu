@@ -94,6 +94,7 @@ func main() {
 	http.HandleFunc("/api/login", loginHandler)
 	http.HandleFunc("/api/scan/queue", queueHandler)
 	http.HandleFunc("/api/scan/cancel", cancelHandler)
+	http.HandleFunc("/api/scan/cancel-all", cancelAllHandler)
 	http.HandleFunc("/api/scan/status", statusHandler)
 	http.HandleFunc("/api/extract", extractHandler)
 	http.HandleFunc("/api/acunetix/stats", acunetixStatsHandler)
@@ -644,6 +645,33 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(stats)
 }
 
+// cancelAllHandler clears all targets with status "Pending" in the ResultsStore
+func cancelAllHandler(w http.ResponseWriter, r *http.Request) {
+	if !isAuthenticated(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	count := 0
+	resultsStore.Range(func(key, value interface{}) bool {
+		scanRes := value.(ScanResult)
+		if scanRes.Status == "Pending" {
+			scanRes.Status = "Cancelled"
+			scanRes.Message = "Cancelled by user"
+			resultsStore.Store(key, scanRes)
+			count++
+		}
+		return true
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "cancelled_count": count})
+}
+
 // Cancel a pending target by overriding its ResultsStore status
 func cancelHandler(w http.ResponseWriter, r *http.Request) {
 	if !isAuthenticated(r) {
@@ -872,10 +900,11 @@ const htmlTemplate = `<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #0d1117;
-            --glass-bg: rgba(22, 27, 34, 0.7);
-            --glass-border: rgba(255, 255, 255, 0.1);
+            --bg-color: #0b0e14;
+            --card-bg: rgba(23, 28, 36, 0.8);
+            --border-primary: rgba(255, 255, 255, 0.08);
             --primary: #58a6ff;
+            --primary-glow: rgba(88, 166, 255, 0.4);
             --primary-hover: #3182ce;
             --text-main: #c9d1d9;
             --text-muted: #8b949e;
@@ -884,138 +913,208 @@ const htmlTemplate = `<!DOCTYPE html>
             --warning: #d29922;
             --input-bg: #0d1117;
             --input-border: #30363d;
+            --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4);
         }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
         
         body {
             background-color: var(--bg-color);
-            background-image: radial-gradient(circle at 15% 50%, rgba(88, 166, 255, 0.08), transparent 25%),
-                              radial-gradient(circle at 85% 30%, rgba(63, 185, 80, 0.05), transparent 25%);
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(88, 166, 255, 0.05) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(63, 185, 80, 0.03) 0%, transparent 40%);
             color: var(--text-main);
             min-height: 100vh;
             display: flex;
             justify-content: center;
-            align-items: center;
+            align-items: flex-start;
             padding: 20px;
+            overflow-x: hidden;
         }
 
         .container {
             width: 100%;
-            max-width: 700px;
-            background: var(--glass-bg);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--glass-border);
-            border-radius: 16px;
+            max-width: 850px;
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border-primary);
+            border-radius: 20px;
             padding: 40px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            transition: all 0.3s ease;
+            box-shadow: var(--shadow-lg);
+            animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+            margin-bottom: 40px;
         }
 
-        h1 { font-size: 24px; font-weight: 600; margin-bottom: 8px; text-align: center; color: #fff; }
-        p.subtitle { text-align: center; color: var(--text-muted); margin-bottom: 30px; font-size: 14px; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h1 { font-size: 28px; font-weight: 700; margin-bottom: 10px; text-align: center; color: #fff; letter-spacing: -0.5px; }
+        p.subtitle { text-align: center; color: var(--text-muted); margin-bottom: 35px; font-size: 15px; }
         
-        .section-title { font-size: 16px; color: #fff; border-bottom: 1px solid var(--input-border); padding-bottom: 5px; margin-bottom: 15px; margin-top: 30px;}
+        .section-header { 
+            display: flex; align-items: center; gap: 10px;
+            font-size: 16px; font-weight: 600; color: #fff; 
+            margin-top: 35px; margin-bottom: 18px;
+            position: relative;
+        }
+        .section-header::after { content: ''; flex: 1; height: 1px; background: var(--input-border); opacity: 0.5; }
 
-        .form-group { margin-bottom: 20px; }
-        .form-row { display: flex; gap: 15px; }
-        .form-row .form-group { flex: 1; }
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 10px;
+        }
 
-        .form-group label { display: block; margin-bottom: 8px; font-size: 14px; font-weight: 500; }
+        .form-group { display: flex; flex-direction: column; gap: 8px; margin-bottom: 5px; }
+        .form-group label { font-size: 13px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
 
         input, textarea, select {
             width: 100%;
             background: var(--input-bg);
             border: 1px solid var(--input-border);
             color: var(--text-main);
-            padding: 12px 16px;
-            border-radius: 8px;
-            font-size: 14px;
+            padding: 14px 18px;
+            border-radius: 10px;
+            font-size: 15px;
             outline: none;
-            transition: border-color 0.2s, box-shadow 0.2s;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
         }
         
         input:focus, textarea:focus, select:focus {
             border-color: var(--primary);
-            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.2);
+            box-shadow: 0 0 0 3px var(--primary-glow), inset 0 2px 4px rgba(0,0,0,0.1);
+            background-color: rgba(13, 17, 23, 0.8);
         }
 
-        input[type="file"] { padding: 9px; cursor: pointer; }
+        input[type="file"] { padding: 10px; cursor: pointer; }
+        textarea { resize: vertical; min-height: 140px; line-height: 1.6; }
 
-        textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
-
-        button {
+        .btn-primary {
             width: 100%;
             background: var(--primary);
             color: #fff;
             border: none;
-            padding: 14px;
-            border-radius: 8px;
+            padding: 16px;
+            border-radius: 12px;
             font-size: 16px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 12px rgba(88, 166, 255, 0.2);
+            display: flex; justify-content: center; align-items: center; gap: 10px;
+            margin-top: 10px;
+        }
+
+        .btn-primary:hover { background: var(--primary-hover); transform: translateY(-1px); box-shadow: 0 6px 16px rgba(88, 166, 255, 0.3); }
+        .btn-primary:active { transform: translateY(0); }
+        .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+        
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--input-border);
+            color: #fff;
+            padding: 12px 20px;
+            border-radius: 10px;
             font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s, transform 0.1s;
+            transition: all 0.2s;
+            font-size: 14px;
         }
+        .btn-secondary:hover { background: rgba(255, 255, 255, 0.1); border-color: var(--text-muted); }
 
-        button:hover { background: var(--primary-hover); }
-        button:active { transform: scale(0.98); }
-        button:disabled { background: var(--text-muted); cursor: not-allowed; transform: none; }
-        
-        button.secondary { background: #21262d; border: 1px solid var(--input-border); }
-        button.secondary:hover { background: #30363d; }
-
-        #error-msg { color: var(--danger); text-align: center; margin-top: 15px; font-size: 14px; display: none; }
-        .hidden { display: none !important; }
-
-        .queue-stats {
+        /* Global Stats Layout */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        .stat-card {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid var(--border-primary);
+            padding: 15px;
+            border-radius: 12px;
             display: flex;
-            justify-content: space-between;
-            background: #21262d;
-            padding: 10px 15px;
-            border-radius: 8px;
-            font-size: 13px;
-            margin-top: 20px;
-            border: 1px solid var(--input-border);
+            flex-direction: column;
+            gap: 5px;
         }
-        .queue-stats span { font-weight: 600; color: #fff;}
+        .stat-card .label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; }
+        .stat-card .value { font-size: 20px; font-weight: 700; color: #fff; }
 
-        /* Results table */
-        .results {
-            margin-top: 15px;
+        .results-container {
+            margin-top: 25px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 15px;
             border: 1px solid var(--input-border);
-            border-radius: 8px;
             overflow: hidden;
-            max-height: 300px;
-            overflow-y: auto;
         }
+        .results-scroll { max-height: 400px; overflow-y: auto; }
         
         .result-item {
-            display: flex; align-items: center; justify-content: space-between;
-            padding: 12px 16px; border-bottom: 1px solid var(--input-border);
-            font-size: 13px;
-            background: rgba(0,0,0,0.2);
+            display: grid;
+            grid-template-columns: 1fr 1fr auto;
+            align-items: center;
+            gap: 15px;
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--input-border);
+            transition: background 0.2s;
         }
+        .result-item:hover { background: rgba(255, 255, 255, 0.02); }
         .result-item:last-child { border-bottom: none; }
-
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
-        }
-
-        .status-Success { color: var(--success); font-weight: 600; }
-        .status-Failed { color: var(--danger); font-weight: 600; }
-        .status-Running { color: var(--primary); font-weight: 600; animation: pulse 1.5s infinite;}
-        .status-Pending { color: var(--warning); font-weight: 600; }
         
-        .loader {
-            border: 3px solid rgba(255,255,255,0.3); border-radius: 50%;
-            border-top: 3px solid #fff; width: 20px; height: 20px;
-            animation: spin 1s linear infinite; display: inline-block;
-            vertical-align: middle; margin-left: 10px; display: none;
+        .target-url { font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .status-msg { font-size: 12px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .status-pill { font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 20px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+        .status-Success { background: rgba(63, 185, 80, 0.1); color: var(--success); }
+        .status-Failed { background: rgba(248, 81, 73, 0.1); color: var(--danger); }
+        .status-Running { background: rgba(88, 166, 255, 0.1); color: var(--primary); animation: glowPulse 2s infinite ease-in-out; }
+        .status-Pending { background: rgba(210, 153, 34, 0.1); color: var(--warning); }
+        .status-Cancelled { background: rgba(139, 148, 158, 0.1); color: var(--text-muted); }
+
+        @keyframes glowPulse {
+            0% { box-shadow: 0 0 0 0 rgba(88, 166, 255, 0); }
+            50% { box-shadow: 0 0 8px 1px rgba(88, 166, 255, 0.3); }
+            100% { box-shadow: 0 0 0 0 rgba(88, 166, 255, 0); }
         }
 
+        .loader {
+            border: 2px solid rgba(255,255,255,0.2); border-radius: 50%;
+            border-top: 2px solid #fff; width: 18px; height: 18px;
+            animation: spin 0.8s linear infinite; display: none;
+        }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* Mobile Adjustments */
+        @media (max-width: 650px) {
+            body { padding: 10px; align-items: flex-start; }
+            .container { padding: 25px 20px; border-radius: 12px; }
+            h1 { font-size: 22px; }
+            p.subtitle { margin-bottom: 25px; }
+            .stats-grid { grid-template-columns: 1fr 1fr; }
+            .result-item { 
+                grid-template-columns: 1fr; 
+                gap: 8px;
+                padding: 20px;
+            }
+            .target-url { font-size: 15px; white-space: normal; word-break: break-all; }
+            .status-msg { font-size: 13px; white-space: normal; }
+            .status-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 5px; }
+
+            .form-grid.auth { grid-template-columns: 1fr; }
+            .form-grid.extraction { grid-template-columns: 1fr; }
+            .form-grid.extraction > .form-group:nth-child(1) { order: 1; }
+            .form-grid.extraction > .form-group:nth-child(2) { order: 2; }
+            .form-grid.extraction > .form-group:last-child { order: 3; margin-top: 5px; }
+        }
+
+        #error-msg { color: var(--danger); text-align: center; margin-top: 15px; font-size: 14px; background: rgba(248, 81, 73, 0.1); padding: 10px; border-radius: 8px; display: none; }
+        .hidden { display: none !important; }
     </style>
 </head>
 <body>
@@ -1030,7 +1129,7 @@ const htmlTemplate = `<!DOCTYPE html>
             <input type="password" id="password" placeholder="Enter password (MD5 checked)" autocomplete="off" onkeypress="handleLoginKey(event)">
         </div>
         
-        <button onclick="login()">Enter <span class="loader" id="login-loader"></span></button>
+        <button class="btn-primary" onclick="login()">Enter <span class="loader" id="login-loader"></span></button>
         <div id="error-msg">Incorrect Password!</div>
     </div>
 
@@ -1040,56 +1139,72 @@ const htmlTemplate = `<!DOCTYPE html>
         <p class="subtitle">Queue manager configures up to 10 concurrent Acunetix targets</p>
 
         <!-- ACUNETIX AUTH -->
-        <div class="form-row">
-            <div class="form-group" style="flex: 2;">
+        <!-- ACUNETIX AUTH -->
+        <div class="form-grid auth">
+            <div class="form-group" style="grid-column: span 2;">
                 <label>Acunetix API URL</label>
                 <input type="text" id="api-url" placeholder="https://your-server:3443/api/v1">
             </div>
-            <div class="form-group" style="flex: 2;">
+            <div class="form-group" style="grid-column: span 2;">
                 <label>Acunetix API Key</label>
                 <input type="password" id="api-key" placeholder="Enter API Key (X-Auth)">
             </div>
-            <div class="form-group" style="flex: 1;">
+            <div class="form-group">
                 <label>Max Scans</label>
                 <input type="number" id="max-scans" value="10" min="1" max="100">
             </div>
         </div>
 
         <!-- GLOBAL STATS -->
-        <div class="section-title">🌍 Acunetix Global Status</div>
-        <div class="queue-stats" id="global-stats" style="margin-top: 5px; margin-bottom: 20px;">
-            <div>Processing/Running: <span id="g-processing" class="status-Running">0</span></div>
-            <div>Scheduled: <span id="g-scheduled" class="status-Pending">0</span></div>
-            <div>Queued: <span id="g-queued" class="status-Pending">0</span></div>
-            <div>Completed: <span id="g-completed" class="status-Success">0</span></div>
-            <div><button style="padding: 4px 12px; font-size: 11px; width: auto;" class="secondary" onclick="fetchGlobalStats()" id="btn-gstats">Refresh</button></div>
+        <div class="section-header">🌍 Acunetix Global Status</div>
+        <div class="stats-grid" id="global-stats">
+            <div class="stat-card">
+                <div class="label">Running</div>
+                <div class="value status-Running" id="g-processing">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Scheduled</div>
+                <div class="value status-Pending" id="g-scheduled">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Queued</div>
+                <div class="value status-Pending" id="g-queued">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Completed</div>
+                <div class="value status-Success" id="g-completed">0</div>
+            </div>
+            <div class="stat-card" style="justify-content: center; align-items: center;">
+                <button class="btn-secondary" onclick="fetchGlobalStats()" id="btn-gstats" style="width: 100%;">Refresh</button>
+            </div>
         </div>
 
         <!-- FILE EXTRACTOR -->
-        <div class="section-title">📂 Bulk File Extraction</div>
-        <div class="form-row" style="align-items: flex-end;">
-            <div class="form-group" style="flex: 2;">
+        <div class="section-header">📂 Bulk File Extraction</div>
+        <div class="form-grid extraction">
+            <div class="form-group" style="grid-column: span 2;">
                 <label>Upload JSONL / CSV / TXT</label>
                 <input type="file" id="upload-file" accept=".json,.csv,.txt">
             </div>
-            <div class="form-group" style="flex: 1;">
+            <div class="form-group">
                 <label>Extract Key</label>
                 <input type="text" id="extract-key" placeholder="e.g. link, host, ip">
             </div>
-            <div class="form-group" style="flex: 1;">
-                <button class="secondary" onclick="extractTargets()" id="extract-btn">Extract <span class="loader" id="extract-loader"></span></button>
+            <div class="form-group" style="justify-content: flex-end;">
+                <button class="btn-secondary" onclick="extractTargets()" id="extract-btn" style="height: 48px;">Extract <span class="loader" id="extract-loader"></span></button>
             </div>
         </div>
 
         <!-- TARGETS -->
-        <div class="section-title">🎯 Scan Queue Setup</div>
+        <div class="section-header">🎯 Scan Queue Setup</div>
         <div class="form-group">
-            <label>Targets (One per line). Duplicates will be automatically omitted before queueing.</label>
+            <label>Targets (One per line). Duplicates will be omitted.</label>
             <textarea id="targets" placeholder="Extracted targets will appear here...&#10;http://target1.com"></textarea>
             <div id="duplicate-warning" style="color: var(--warning); font-size: 13px; margin-top: 8px; display: none;"></div>
         </div>
 
-        <button onclick="queueScans()" id="scan-btn">Add to Scan Queue <span class="loader" id="scan-loader"></span></button>
+        <button class="btn-primary" onclick="queueScans()" id="scan-btn">Add to Scan Queue <span class="loader" id="scan-loader"></span></button>
+        <button class="btn-secondary" onclick="cancelAllPending()" id="cancel-all-btn" style="margin-top: 10px; color: var(--danger); border-color: rgba(248, 81, 73, 0.2);">Cancel All Pending <span class="loader" id="cancel-all-loader"></span></button>
         
         <!-- SKIPPED TARGETS LOG -->
         <div class="form-group hidden" id="skipped-box" style="margin-top: 20px;">
@@ -1098,15 +1213,26 @@ const htmlTemplate = `<!DOCTYPE html>
         </div>
         
         <!-- QUEUE STATS -->
-        <div class="queue-stats hidden" id="queue-stats">
-            <div>Active Workers: <span id="stat-active">0</span>/<span id="stat-max">10</span></div>
-            <div>Waiting in Queue: <span id="stat-queue">0</span></div>
-            <div>Total Processed: <span id="stat-total">0</span></div>
+        <div class="stats-grid hidden" id="queue-stats" style="margin-top: 25px;">
+            <div class="stat-card">
+                <div class="label">Active Workers</div>
+                <div class="value"><span id="stat-active">0</span> / <span id="stat-max">10</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="label">In Queue</div>
+                <div class="value" id="stat-queue">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Processed</div>
+                <div class="value" id="stat-total">0</div>
+            </div>
         </div>
 
         <!-- RESULTS TABLE -->
-        <div class="results hidden" id="results-box">
-            <!-- Results injected here -->
+        <div class="results-container hidden" id="results-box">
+            <div class="results-scroll" id="results-list">
+                <!-- Results injected here -->
+            </div>
         </div>
     </div>
 
@@ -1372,25 +1498,32 @@ const htmlTemplate = `<!DOCTYPE html>
 
                 // Build Table
                 const resultsBox = document.getElementById('results-box');
+                const resultsList = document.getElementById('results-list');
                 if (data.results && data.results.length > 0) {
                     resultsBox.classList.remove('hidden');
                     let html = '';
                     
-                    // Sort so Running is at top, then pending, then finished
                     const sorted = data.results.sort((a,b) => {
-                        const score = {"Running":3, "Pending":2, "Failed":1, "Success":0};
+                        const score = {"Running":3, "Pending":2, "Failed":1, "Success":0, "Cancelled": -1};
                         return score[b.status] - score[a.status];
                     });
 
                     sorted.forEach(item => {
                         let cancelHtml = "";
                         if (item.status === 'Pending') {
-                            cancelHtml = "<button onclick=\"cancelTarget('" + item.target + "')\" style=\"padding: 2px 6px; font-size:10px; border-radius:4px; max-width:65px; margin-left:10px; background:var(--danger);\">Cancel</button>";
+                            cancelHtml = '<button onclick="cancelTarget(\'' + item.target + '\')" class="btn-secondary" style="padding: 4px 10px; font-size:11px; color:var(--danger); border-color:rgba(248, 81, 73, 0.2);">Cancel</button>';
                         }
                         
-                        html += "<div class=\"result-item\"><span style=\"max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;\" title=\"" + item.target + "\">" + item.target + "</span><span style=\"font-size:11px; color:#8b949e; max-width: 25%; overflow: hidden; white-space: nowrap;\" title=\"" + item.message + "\">" + item.message + "</span><div style=\"display:flex; align-items:center;\"><span class=\"status-" + item.status + "\">[" + item.status + "]</span>" + cancelHtml + "</div></div>";
+                        html += '<div class="result-item">' +
+                                '<div class="target-url" title="' + item.target + '">' + item.target + '</div>' +
+                                '<div class="status-msg" title="' + item.message + '">' + item.message + '</div>' +
+                                '<div class="status-actions">' +
+                                    '<span class="status-pill status-' + item.status + '">' + item.status + '</span>' +
+                                    cancelHtml +
+                                '</div>' +
+                            '</div>';
                     });
-                    resultsBox.innerHTML = html;
+                    resultsList.innerHTML = html;
                 }
             } catch (err) {
                 console.error("Polling error", err);
@@ -1411,6 +1544,34 @@ const htmlTemplate = `<!DOCTYPE html>
                 }
             } catch (err) {
                 console.error("Cancel Error: ", err);
+            }
+        }
+
+        async function cancelAllPending() {
+            if (!confirm("Are you sure you want to cancel ALL pending targets in the local queue?")) return;
+            
+            const btn = document.getElementById('cancel-all-btn');
+            const loader = document.getElementById('cancel-all-loader');
+            btn.disabled = true;
+            loader.style.display = 'inline-block';
+
+            try {
+                const res = await fetch('/api/scan/cancel-all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    alert("Cancelled " + data.cancelled_count + " pending targets.");
+                    pollStatus(); // force UI update
+                } else {
+                    alert("Failed to cancel pending targets.");
+                }
+            } catch (err) {
+                console.error("Cancel All Error: ", err);
+            } finally {
+                btn.disabled = false;
+                loader.style.display = 'none';
             }
         }
 
