@@ -340,18 +340,20 @@ func pollScan(client *http.Client, apiURL, apiKey, scanID string) error {
 			log.Printf("Error polling scan %s: %v", scanID, err)
 			continue
 		}
-		defer resp.Body.Close() // Ensure body is closed in each iteration
 
 		var result struct {
 			CurrentSession struct {
 				Status string `json:"status"`
 			} `json:"current_session"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close() // Fix: Close body immediately instead of using defer in loop
+
+		if err != nil {
 			return fmt.Errorf("failed to decode status for scan %s: %v", scanID, err)
 		}
 
-		status := result.CurrentSession.Status
+		status := strings.ToLower(result.CurrentSession.Status)
 		if status == "completed" {
 			return nil // Scan finished successfully
 		}
@@ -593,7 +595,7 @@ func queueHandler(w http.ResponseWriter, r *http.Request) {
 			APIURL: payload.APIURL,
 			APIKey: payload.APIKey,
 			Target: t,
-			Client: &http.Client{Transport: tr, Timeout: 10 * time.Second}, // Standard timeout for worker threads
+			Client: &http.Client{Transport: tr, Timeout: 60 * time.Second}, // Increased timeout to handle slow API responses
 		}
 
 		resultsStore.Store(t, ScanResult{Target: t, Status: "Pending", Message: "Waiting in queue..."})
