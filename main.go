@@ -17,7 +17,6 @@ import (
 )
 
 var (
-	// Store the expected MD5 hash for the password "Zalabia@9"
 	expectedPasswordHash = "94cda1e5b3b0eb41e28b69e951d33242"
 	// Profile ID for SQL Injection Vulnerabilities
 	sqlInjectionProfileID = "11111111-1111-1111-1111-111111111113"
